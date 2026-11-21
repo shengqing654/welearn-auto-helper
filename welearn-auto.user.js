@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WE Learn 自动填写提交 v4
 // @namespace    local.welearn.auto
-// @version      4.2.0
-// @description  填空、选择、判断题；自动提交并回目录核验；批量处理未完成项
+// @version      4.3.1
+// @description  填空、选择、判断题；自动提交并回目录核验；支持按目录范围批量处理
 // @match        https://welearn.sflep.com/*
 // @match        https://centercourseware.sflep.com/*
 // @run-at       document-end
@@ -22,14 +22,14 @@
   const panel = document.createElement('section');
   panel.id = CHANNEL;
   panel.style.cssText = 'position:fixed;left:12px;bottom:16px;z-index:2147483647;width:300px;padding:12px;background:white;color:#183153;border:2px solid #2463a6;border-radius:8px;font:14px/1.6 sans-serif;box-shadow:0 3px 15px #0003';
-  const title = document.createElement('strong'); title.textContent = '自动填写提交 v4.2 加速版';
+  const title = document.createElement('strong'); title.textContent = '自动填写提交 v4.3.1';
   const status = document.createElement('div'); status.id = 'welearn-auto-status';
   panel.append(title, status); document.body.append(panel);
   const show = text => { status.textContent = text; };
-  function button(id, label, handler) {
+  function button(id, label, handler, group = panel) {
     const b = document.createElement('button'); b.id = id; b.textContent = label;
     b.style.cssText = 'margin:6px 6px 0 0;padding:7px;background:#2463a6;color:white;border:0;border-radius:4px;cursor:pointer';
-    b.onclick = handler; panel.append(b); return b;
+    b.onclick = handler; group.append(b); return b;
   }
   function controller(el, name) {
     const angular = el.ownerDocument.defaultView.angular;
@@ -170,6 +170,11 @@
   }
   const read = () => { try { return JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch { return null; } };
   const save = state => localStorage.setItem(storageKey, JSON.stringify(state));
+  const LESSON_DWELL_MS = 60_000;
+  const LESSON_TIMEOUT_MS = 60_000;
+  let batchTimer, lessonReadyAt;
+  let dwellProgressTimer, refreshDwellProgress;
+  let lessonClosing = false, sawWrongRoute = false;
   function rows() {
     return [...document.querySelectorAll('div[id^="collapse_ITEM-"] li[onclick*="StartSCO"]')].map(el => {
       const id = el.getAttribute('onclick').match(/StartSCO\('([^']+)'\)/)?.[1];
@@ -179,23 +184,155 @@
   function goDirectory(state) { location.assign(state.directory); }
   function goTask(state) {
     const item = state.queue[state.index];
-    if (!item) { state.active = false; save(state); show(`批量结束：目录确认 ${state.log.filter(x => x.ok).length} 项；待处理 ${state.log.filter(x => !x.ok).length} 项。可导出记录。`); return; }
+    if (!item) {
+      state.active = false; save(state); syncRangeControls(state);
+      show(`批量结束：目录确认 ${state.log.filter(x => x.ok).length} 项；待处理 ${state.log.filter(x => !x.ok).length} 项。可导出记录。`);
+      return;
+    }
     const target = new URL('/student/StudyCourse.aspx', courseOrigin);
     target.searchParams.set('cid', state.cid); target.searchParams.set('classid', state.classid); target.searchParams.set('sco', item.id);
     state.phase = 'work'; state.started = Date.now(); save(state); location.assign(target.href);
   }
-  button('welearn-auto-start', '从目录批量开始 / 继续', () => {
+  function activeLesson(expected) {
+    const current = read();
+    if (current?.active && current.phase === 'work' && current.index === expected.index &&
+        current.started === expected.started && current.queue[current.index]?.id === params.get('sco')) return current;
+    return null;
+  }
+  function startDwellProgress() {
+    const countdown = document.createElement('div');
+    countdown.id = 'welearn-auto-dwell-countdown';
+    countdown.style.cssText = 'margin-top:6px;font-variant-numeric:tabular-nums';
+    const progress = document.createElement('progress');
+    progress.id = 'welearn-auto-dwell-progress';
+    progress.max = LESSON_DWELL_MS;
+    progress.setAttribute('aria-label', '本页停留进度');
+    progress.style.cssText = 'display:block;width:100%;height:8px;margin:4px 0 6px;accent-color:#2463a6';
+    status.after(countdown, progress);
+
+    refreshDwellProgress = () => {
+      const elapsed = Math.min(LESSON_DWELL_MS, performance.now() - lessonReadyAt);
+      const seconds = Math.ceil((LESSON_DWELL_MS - elapsed) / 1000);
+      progress.value = elapsed;
+      countdown.textContent = `本页停留 · 剩余 ${seconds} 秒`;
+      if (seconds === 0) clearInterval(dwellProgressTimer);
+    };
+    dwellProgressTimer = setInterval(refreshDwellProgress, 1000);
+    refreshDwellProgress();
+  }
+  function finishLesson(state, {ok, reason}) {
+    refreshDwellProgress?.();
+    clearInterval(dwellProgressTimer);
+    state.routeErrors = 0;
+    if (ok) { state.phase = 'verify'; state.verify = 0; }
+    else { state.log.push({...state.queue[state.index], ok: false, reason}); state.index++; }
+    save(state); goDirectory(state);
+  }
+  function finishAfterDwell(state, result) {
+    lessonClosing = true;
+    clearTimeout(batchTimer);
+    const remaining = Math.ceil(LESSON_DWELL_MS - (performance.now() - lessonReadyAt));
+    if (remaining > 0) {
+      const completed = state.queue[state.index].complete;
+      show(`${completed ? '该任务已完成' : '本页处理已结束'}，停留满 60 秒后返回目录核验。`);
+    }
+    batchTimer = setTimeout(() => {
+      const current = activeLesson(state);
+      if (current) finishLesson(current, result);
+    }, Math.max(0, remaining));
+  }
+  function watchLesson(state) {
+    clearTimeout(batchTimer);
+    batchTimer = setTimeout(() => {
+      const current = activeLesson(state);
+      if (!current) return;
+      lessonClosing = true;
+      if (sawWrongRoute && lessonReadyAt === undefined) {
+        if (!current.routeErrors) {
+          current.routeErrors = 1; save(current); location.reload(); return;
+        }
+        finishLesson(current, {ok: false, reason: '章节内容与目录目标不一致'});
+      } else {
+        finishLesson(current, {ok: false, reason: '练习未就绪或处理超时'});
+      }
+    }, LESSON_TIMEOUT_MS);
+  }
+  function rangeSelect(fields, id, text) {
+    const label = document.createElement('label');
+    label.textContent = text;
+    label.style.cssText = 'display:block;margin:4px 0';
+    const select = document.createElement('select');
+    select.id = id;
+    select.style.cssText = 'display:block;width:100%;margin-top:2px;font:inherit';
+    label.append(select); fields.append(label);
+    return select;
+  }
+  function createRangeControls() {
+    const fields = document.createElement('fieldset');
+    fields.style.cssText = 'margin:8px 0 0;padding:6px 8px 8px;min-width:0;border:1px solid #bfd0ec;border-radius:6px';
+    fields.disabled = true;
+    const legend = document.createElement('legend');
+    legend.textContent = '批量范围';
+    fields.append(legend); panel.append(fields);
+    const start = rangeSelect(fields, 'welearn-auto-range-start', '起始任务');
+    const end = rangeSelect(fields, 'welearn-auto-range-end', '结束任务');
+    const label = document.createElement('label');
+    label.style.display = 'block';
+    const includeCompleted = document.createElement('input');
+    includeCompleted.id = 'welearn-auto-range-completed';
+    includeCompleted.type = 'checkbox';
+    includeCompleted.checked = true;
+    label.append(includeCompleted, ' 包含已完成任务');
+    fields.append(label);
+    button('welearn-auto-start', '开始所选范围', () => startRange(start.value, end.value, includeCompleted.checked), fields);
+    const resume = button('welearn-auto-resume', '继续上次批量', resumeBatch);
+    resume.hidden = true;
+    return {fields, start, end, resume};
+  }
+  const range = /course_info\.aspx/i.test(location.pathname) ? createRangeControls() : null;
+  function populateRange(list) {
+    list.forEach(({id, name, complete}, index) => {
+      const label = `${index + 1}. ${name}${complete ? '（已完成）' : ''}`;
+      range.start.add(new Option(label, id));
+      range.end.add(new Option(label, id));
+    });
+    range.end.selectedIndex = list.length - 1;
+  }
+  const canResume = state => !state?.active && !state?.finished && !!state?.queue?.[state.index];
+  function syncRangeControls(state) {
+    if (!range) return;
+    const hasTasks = range.start.options.length > 0;
+    range.fields.disabled = !hasTasks || !!state?.active;
+    range.resume.hidden = !hasTasks || !canResume(state);
+  }
+  function startRange(startId, endId, includeCompleted) {
+    if (read()?.active) return;
     const list = rows();
-    if (!list.length) { show('请先回到课程目录页，再点批量开始。'); return; }
-    const existing = read();
-    if (existing && existing.index < existing.queue.length && !existing.finished) { existing.active = true; save(existing); goTask(existing); return; }
+    const start = list.findIndex(item => item.id === startId);
+    const end = list.findIndex(item => item.id === endId);
+    if (start < 0 || end < 0) { show('任务列表已变化，请刷新目录后重新选择。'); return; }
+    if (start > end) { show('结束任务应位于起始任务之后，或与起始任务相同。'); return; }
+    const queue = list.slice(start, end + 1).filter(item => includeCompleted || !item.complete);
+    if (!queue.length) { show('所选范围内没有未完成任务。'); return; }
     const classid = params.get('classid') || document.querySelector('a[href*="quitClass"]')?.getAttribute('href')?.match(/quitClass\('([0-9]+)'/)?.[1];
     if (!classid) { show('没有找到班级编号，已停止。'); return; }
-    const state = {active: true, cid: params.get('cid'), classid, directory: location.href, queue: list.filter(x => !x.complete), index: 0, phase: 'work', log: [], verify: 0};
-    save(state); goTask(state);
-  });
+    const state = {active: true, cid: params.get('cid'), classid, directory: location.href, queue, index: 0, phase: 'work', log: [], verify: 0};
+    syncRangeControls(state);
+    goTask(state);
+  }
+  function resumeBatch() {
+    const state = read();
+    if (!canResume(state)) return;
+    state.active = true;
+    syncRangeControls(state);
+    if (state.phase === 'verify') { save(state); location.reload(); }
+    else goTask(state);
+  }
   button('welearn-auto-stop', '停止批量', () => {
     const state = read(); if (state) { state.active = false; save(state); }
+    syncRangeControls(state);
+    clearTimeout(batchTimer);
+    clearInterval(dwellProgressTimer);
     document.querySelector('iframe[name="contentFrame"]')?.contentWindow?.postMessage({channel: CHANNEL, type: 'stop'}, childOrigin);
     show('已停止批量处理。');
     if (/StudyCourse\.aspx/i.test(location.pathname)) panel.hidden = true;
@@ -210,49 +347,70 @@
     if (event.origin !== childOrigin || event.source !== frame?.contentWindow || event.data?.channel !== CHANNEL) return;
     const state = read();
     if (event.data.type === 'ready') frame.contentWindow.postMessage({channel: CHANNEL, type: 'batch-state', active: !!state?.active}, childOrigin);
-    if (!state?.active || state.phase !== 'work') return;
+    if (!state?.active || state.phase !== 'work' || lessonClosing) return;
     const item = state.queue[state.index]; if (!item || params.get('sco') !== item.id) return;
     if (event.data.type === 'ready') {
       const uuid = item.id.replace(/^ITEM-/, '');
-      if (!event.data.ids.some(id => id === 'u' + uuid)) {
-        state.routeErrors = (state.routeErrors || 0) + 1; save(state);
-        if (state.routeErrors === 1) location.reload();
-        else { state.log.push({...item, ok: false, reason: '章节内容与目录目标不一致'}); state.index++; state.routeErrors = 0; save(state); goDirectory(state); }
+      if (!Array.isArray(event.data.ids) || !event.data.ids.includes('u' + uuid)) {
+        sawWrongRoute = true;
         return;
       }
+      if (lessonReadyAt === undefined) {
+        lessonReadyAt = performance.now();
+        startDwellProgress();
+        if (item.complete) {
+          finishAfterDwell(state, {ok: true});
+          return;
+        }
+        watchLesson(state);
+      }
       frame.contentWindow.postMessage({channel: CHANNEL, type: 'run', id: item.id}, childOrigin);
-    } else if (event.data.type === 'result' && event.data.id === item.id) {
-      state.routeErrors = 0;
-      if (event.data.ok) { state.phase = 'verify'; state.verify = 0; }
-      else { state.log.push({...item, ok: false, reason: event.data.reason}); state.index++; }
-      save(state); goDirectory(state);
+    } else if (event.data.type === 'result' && event.data.id === item.id && lessonReadyAt !== undefined) {
+      finishAfterDwell(state, event.data);
     }
   });
   async function boot() {
+    let list;
+    if (range) {
+      show('正在读取课程目录…');
+      list = rows();
+      for (let n = 0; n < 100 && !list.length; n++) {
+        await sleep(100);
+        list = rows();
+      }
+      populateRange(list);
+    }
     const state = read();
+    syncRangeControls(state);
+    if (range && !list.length) {
+      if (state?.active) { state.active = false; save(state); }
+      show('目录未加载，已暂停。');
+      return;
+    }
     if (!state?.active) {
-      show('请在课程目录点击批量开始。');
+      show(range ? '请选择起始任务和结束任务。' : '请在课程目录选择批量范围。');
       if (/StudyCourse\.aspx/i.test(location.pathname)) panel.hidden = true;
       return;
     }
     show(`批量处理中 ${Math.min(state.index + 1, state.queue.length)}/${state.queue.length}：${state.queue[state.index]?.name || ''}`);
-    if (/course_info\.aspx/i.test(location.pathname)) {
-      for (let n = 0; n < 100 && !rows().length; n++) await sleep(100);
-      if (!rows().length) { state.active = false; save(state); show('目录未加载，已暂停。'); return; }
+    if (range) {
       if (state.phase === 'verify') {
-        const item = state.queue[state.index], row = rows().find(x => x.id === item.id);
-        if (!row?.complete && state.verify < 1) { state.verify++; save(state); await sleep(1800); if (read()?.active) location.reload(); return; }
+        const item = state.queue[state.index], row = list.find(x => x.id === item.id);
+        if (!row?.complete && state.verify < 1) {
+          state.verify++;
+          save(state);
+          batchTimer = setTimeout(() => {
+            const current = read();
+            if (current?.active && current.phase === 'verify' && current.started === state.started && current.index === state.index) location.reload();
+          }, 1800);
+          return;
+        }
         state.log.push({...item, ok: !!row?.complete, reason: row?.complete ? '课程目录已确认完成' : '提交后目录仍未确认完成'});
         state.index++; state.phase = 'work'; save(state);
       }
       if (read()?.active) goTask(state);
-    } else if (/StudyCourse\.aspx/i.test(location.pathname)) {
-      setTimeout(() => {
-        const current = read();
-        if (current?.active && current.index === state.index && current.phase === 'work') {
-          current.log.push({...current.queue[current.index], ok: false, reason: '练习未就绪或处理超时'}); current.index++; save(current); goDirectory(current);
-        }
-      }, 60000);
+    } else if (/StudyCourse\.aspx/i.test(location.pathname) && activeLesson(state)) {
+      watchLesson(state);
     }
   }
   boot();
