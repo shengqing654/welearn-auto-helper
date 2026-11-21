@@ -9,7 +9,7 @@ const directory = 'https://welearn.sflep.com/student/course_info.aspx?cid=293&cl
 const lesson = 'https://welearn.sflep.com/student/StudyCourse.aspx?cid=293&classid=1&sco=ITEM-demo';
 const storageKey = 'welearn-auto-v4-293';
 
-function batchFixture(t, complete = false) {
+function batchFixture(t, complete = false, dwellSeconds) {
   const dom = new JSDOM('<iframe name="contentFrame"></iframe>', { runScripts: 'outside-only', url: lesson });
   const { window } = dom;
   t.after(() => window.close());
@@ -22,7 +22,7 @@ function batchFixture(t, complete = false) {
 
   window.localStorage.setItem(storageKey, JSON.stringify({
     active: true, cid: '293', classid: '1', directory, queue: [{ id: 'ITEM-demo', name: 'Demo', complete }],
-    index: 0, phase: 'work', log: [], started: 123,
+    index: 0, phase: 'work', log: [], started: 123, dwellSeconds,
   }));
   const visits = [];
   const location = new URL(lesson);
@@ -49,6 +49,23 @@ function batchFixture(t, complete = false) {
     stop: () => window.document.querySelector('#welearn-auto-stop').click(),
     state: () => JSON.parse(window.localStorage.getItem(storageKey)),
   };
+}
+
+for (const [seconds, processingMs] of [[30, 10_000], [90, 65_000]]) {
+  test(`uses the selected ${seconds} seconds for the countdown and departure`, t => {
+    const batch = batchFixture(t, false, seconds);
+    batch.ready();
+    assert.match(batch.countdown(), new RegExp(`剩余 ${seconds} 秒`));
+    assert.equal(batch.progress().max, seconds * 1000);
+    batch.advance(processingMs);
+    assert.deepEqual(batch.visits, []);
+    batch.result(true);
+    batch.advance(seconds * 1000 - processingMs - 1);
+    assert.deepEqual(batch.visits, []);
+    batch.advance(1);
+    assert.deepEqual(batch.visits, [directory]);
+    assert.equal(batch.state().phase, 'verify');
+  });
 }
 
 test('shows the elapsed dwell and remaining seconds from readiness through the return to the directory', t => {

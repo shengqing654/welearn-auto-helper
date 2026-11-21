@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WE Learn 自动填写提交 v4
 // @namespace    local.welearn.auto
-// @version      4.3.1
+// @version      4.4.0
 // @description  填空、选择、判断题；自动提交并回目录核验；支持按目录范围批量处理
 // @match        https://welearn.sflep.com/*
 // @match        https://centercourseware.sflep.com/*
@@ -22,7 +22,7 @@
   const panel = document.createElement('section');
   panel.id = CHANNEL;
   panel.style.cssText = 'position:fixed;left:12px;bottom:16px;z-index:2147483647;width:300px;padding:12px;background:white;color:#183153;border:2px solid #2463a6;border-radius:8px;font:14px/1.6 sans-serif;box-shadow:0 3px 15px #0003';
-  const title = document.createElement('strong'); title.textContent = '自动填写提交 v4.3.1';
+  const title = document.createElement('strong'); title.textContent = '自动填写提交 v4.4.0';
   const status = document.createElement('div'); status.id = 'welearn-auto-status';
   panel.append(title, status); document.body.append(panel);
   const show = text => { status.textContent = text; };
@@ -170,11 +170,17 @@
   }
   const read = () => { try { return JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch { return null; } };
   const save = state => localStorage.setItem(storageKey, JSON.stringify(state));
-  const LESSON_DWELL_MS = 60_000;
+  const DEFAULT_DWELL_SECONDS = 60;
+  const DWELL_STEP_SECONDS = 30;
+  // Browser timeouts are limited to a signed 32-bit delay in milliseconds.
+  const MAX_DWELL_SECONDS = Math.floor(2_147_483_647 / (DWELL_STEP_SECONDS * 1000)) * DWELL_STEP_SECONDS;
   const LESSON_TIMEOUT_MS = 60_000;
-  let batchTimer, lessonReadyAt;
+  let batchTimer, lessonReadyAt, lessonDwellMs;
   let dwellProgressTimer, refreshDwellProgress;
   let lessonClosing = false, sawWrongRoute = false;
+  const validDwellSeconds = seconds => Number.isInteger(seconds) &&
+    seconds >= DWELL_STEP_SECONDS && seconds <= MAX_DWELL_SECONDS && seconds % DWELL_STEP_SECONDS === 0;
+  const dwellSecondsFor = state => validDwellSeconds(state?.dwellSeconds) ? state.dwellSeconds : DEFAULT_DWELL_SECONDS;
   function rows() {
     return [...document.querySelectorAll('div[id^="collapse_ITEM-"] li[onclick*="StartSCO"]')].map(el => {
       const id = el.getAttribute('onclick').match(/StartSCO\('([^']+)'\)/)?.[1];
@@ -205,14 +211,14 @@
     countdown.style.cssText = 'margin-top:6px;font-variant-numeric:tabular-nums';
     const progress = document.createElement('progress');
     progress.id = 'welearn-auto-dwell-progress';
-    progress.max = LESSON_DWELL_MS;
+    progress.max = lessonDwellMs;
     progress.setAttribute('aria-label', '本页停留进度');
     progress.style.cssText = 'display:block;width:100%;height:8px;margin:4px 0 6px;accent-color:#2463a6';
     status.after(countdown, progress);
 
     refreshDwellProgress = () => {
-      const elapsed = Math.min(LESSON_DWELL_MS, performance.now() - lessonReadyAt);
-      const seconds = Math.ceil((LESSON_DWELL_MS - elapsed) / 1000);
+      const elapsed = Math.min(lessonDwellMs, performance.now() - lessonReadyAt);
+      const seconds = Math.ceil((lessonDwellMs - elapsed) / 1000);
       progress.value = elapsed;
       countdown.textContent = `本页停留 · 剩余 ${seconds} 秒`;
       if (seconds === 0) clearInterval(dwellProgressTimer);
@@ -231,17 +237,17 @@
   function finishAfterDwell(state, result) {
     lessonClosing = true;
     clearTimeout(batchTimer);
-    const remaining = Math.ceil(LESSON_DWELL_MS - (performance.now() - lessonReadyAt));
+    const remaining = Math.ceil(lessonDwellMs - (performance.now() - lessonReadyAt));
     if (remaining > 0) {
       const completed = state.queue[state.index].complete;
-      show(`${completed ? '该任务已完成' : '本页处理已结束'}，停留满 60 秒后返回目录核验。`);
+      show(`${completed ? '该任务已完成' : '本页处理已结束'}，停留满 ${lessonDwellMs / 1000} 秒后返回目录核验。`);
     }
     batchTimer = setTimeout(() => {
       const current = activeLesson(state);
       if (current) finishLesson(current, result);
     }, Math.max(0, remaining));
   }
-  function watchLesson(state) {
+  function watchLesson(state, timeout = LESSON_TIMEOUT_MS) {
     clearTimeout(batchTimer);
     batchTimer = setTimeout(() => {
       const current = activeLesson(state);
@@ -255,7 +261,7 @@
       } else {
         finishLesson(current, {ok: false, reason: '练习未就绪或处理超时'});
       }
-    }, LESSON_TIMEOUT_MS);
+    }, timeout);
   }
   function rangeSelect(fields, id, text) {
     const label = document.createElement('label');
@@ -276,6 +282,18 @@
     fields.append(legend); panel.append(fields);
     const start = rangeSelect(fields, 'welearn-auto-range-start', '起始任务');
     const end = rangeSelect(fields, 'welearn-auto-range-end', '结束任务');
+    const dwellLabel = document.createElement('label');
+    dwellLabel.textContent = `每页停留（秒，每次调整 ${DWELL_STEP_SECONDS} 秒）`;
+    dwellLabel.style.cssText = 'display:block;margin:4px 0';
+    const dwell = document.createElement('input');
+    dwell.id = 'welearn-auto-dwell-seconds';
+    dwell.type = 'number';
+    dwell.min = String(DWELL_STEP_SECONDS);
+    dwell.max = String(MAX_DWELL_SECONDS);
+    dwell.step = String(DWELL_STEP_SECONDS);
+    dwell.value = String(dwellSecondsFor(read()));
+    dwell.style.cssText = 'display:block;width:9ch;margin-top:2px;font:inherit';
+    dwellLabel.append(dwell); fields.append(dwellLabel);
     const label = document.createElement('label');
     label.style.display = 'block';
     const includeCompleted = document.createElement('input');
@@ -284,7 +302,7 @@
     includeCompleted.checked = true;
     label.append(includeCompleted, ' 包含已完成任务');
     fields.append(label);
-    button('welearn-auto-start', '开始所选范围', () => startRange(start.value, end.value, includeCompleted.checked), fields);
+    button('welearn-auto-start', '开始所选范围', () => startRange(start.value, end.value, includeCompleted.checked, dwell.valueAsNumber), fields);
     const resume = button('welearn-auto-resume', '继续上次批量', resumeBatch);
     resume.hidden = true;
     return {fields, start, end, resume};
@@ -305,8 +323,12 @@
     range.fields.disabled = !hasTasks || !!state?.active;
     range.resume.hidden = !hasTasks || !canResume(state);
   }
-  function startRange(startId, endId, includeCompleted) {
+  function startRange(startId, endId, includeCompleted, dwellSeconds) {
     if (read()?.active) return;
+    if (!validDwellSeconds(dwellSeconds)) {
+      show(`请输入 ${DWELL_STEP_SECONDS} 秒的正整数倍，例如 30、60 或 90。`);
+      return;
+    }
     const list = rows();
     const start = list.findIndex(item => item.id === startId);
     const end = list.findIndex(item => item.id === endId);
@@ -316,7 +338,7 @@
     if (!queue.length) { show('所选范围内没有未完成任务。'); return; }
     const classid = params.get('classid') || document.querySelector('a[href*="quitClass"]')?.getAttribute('href')?.match(/quitClass\('([0-9]+)'/)?.[1];
     if (!classid) { show('没有找到班级编号，已停止。'); return; }
-    const state = {active: true, cid: params.get('cid'), classid, directory: location.href, queue, index: 0, phase: 'work', log: [], verify: 0};
+    const state = {active: true, cid: params.get('cid'), classid, directory: location.href, queue, index: 0, phase: 'work', log: [], verify: 0, dwellSeconds};
     syncRangeControls(state);
     goTask(state);
   }
@@ -356,13 +378,14 @@
         return;
       }
       if (lessonReadyAt === undefined) {
+        lessonDwellMs = dwellSecondsFor(state) * 1000;
         lessonReadyAt = performance.now();
         startDwellProgress();
         if (item.complete) {
           finishAfterDwell(state, {ok: true});
           return;
         }
-        watchLesson(state);
+        watchLesson(state, Math.max(LESSON_TIMEOUT_MS, lessonDwellMs));
       }
       frame.contentWindow.postMessage({channel: CHANNEL, type: 'run', id: item.id}, childOrigin);
     } else if (event.data.type === 'result' && event.data.id === item.id && lessonReadyAt !== undefined) {
